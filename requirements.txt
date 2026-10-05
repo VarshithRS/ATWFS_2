@@ -1,0 +1,19 @@
+# Pinned to the versions this project was built and smoke-tested with (Python 3.12, Linux, CPU).
+# Windows CPU: `pip install -r requirements.txt` gives the CPU build of torch by default.
+# Colab/Kaggle: torch/torchvision are preinstalled with CUDA; skip those two lines there if you prefer.
+torch==2.14.1
+torchvision==0.29.1
+# numpy/scipy: newer pins need Python>=3.11; Python 3.10 gets the last compatible releases (3.10 pins not tested here)
+numpy==2.4.4; python_version >= "3.11"
+numpy==2.2.6; python_version < "3.11"
+scipy==1.17.1; python_version >= "3.11"
+scipy==1.15.3; python_version < "3.11"
+# headless OpenCV is enough for everything except live cv2.imshow display (--display);
+# for the window use `opencv-python==4.13.0.92` instead.
+opencv-python-headless==4.13.0.92
+pillow==12.1.1
+PyYAML==6.0.3
+matplotlib==3.10.8
+pytest==9.1.1
+# YOLOv8n obstacle detector (optional: pipeline degrades gracefully to "no detector" without it)
+ultralytics==8.4.173

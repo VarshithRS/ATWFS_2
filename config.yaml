@@ -1,0 +1,186 @@
+# =============================================================================
+# Central configuration. Every path / hyperparameter lives here.
+# >>> ACTION REQUIRED: set paths.data_root to where your IDD Segmentation
+#     (IDD 20k Part I) folder lives. Relative paths resolve from this file's
+#     folder. Nothing machine-specific is hardcoded anywhere in the code.
+# =============================================================================
+seed: 42
+
+paths:
+  data_root: ./data/idd            # <-- UPDATE ME (contains leftImg8bit/ and gtFine/)
+  output_dir: ./outputs
+  checkpoint_dir: ./outputs/checkpoints
+  report_dir: ./outputs/reports
+
+data:
+  image_size: [256, 256]           # (H, W); must be divisible by 32 for exact skip alignment
+  num_workers: 0                   # raise on Colab/Kaggle (e.g. 2-4)
+  image_suffix: _leftImg8bit.png
+  mask_suffix: _gtFine_labellevel3Ids.png   # official AutoNUE naming (public-code README)
+  ignore_label: 255
+  # Official IDD level-3 hierarchy (AutoNUE/public-code helpers/anue_labels.py):
+  #   level3Id 0 = road, 1 = parking + drivable fallback  -> level1 "drivable"
+  #   level3Id 3 = sidewalk/non-drivable fallback is NOT drivable.
+  drivable_level3_ids: [0, 1]
+  # Obstacle-like level-3 ids (person, rider, motorcycle, bicycle, autorickshaw,
+  # car, truck, bus, vehicle fallback). Used only for failure analysis.
+  obstacle_level3_ids: [4, 5, 6, 7, 8, 9, 10, 11, 12]
+  expected_split_sizes: {train: 6993, val: 981, test: 2029}
+  # NOTE: the public IDD release ships NO ground-truth masks for the test split.
+  eval_split: val                  # split used for benchmark/evaluation on real data
+  imagenet_mean: [0.485, 0.456, 0.406]
+  imagenet_std: [0.229, 0.224, 0.225]
+
+terrain:
+  # IDD has NO terrain labels. Real-data terrain labels are -1 (ignored in loss)
+  # until you supply them (TODO). Synthetic data carries terrain labels.
+  classes: [paved, unpaved, vegetation, water_or_other]
+
+augmentation:
+  standard:
+    enabled: true
+    hflip_p: 0.5
+    crop_p: 0.5
+    crop_scale: [0.6, 1.0]
+    jitter_p: 0.8
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.03
+  synthetic:                       # rare-condition augmentation, independent toggle
+    enabled: false
+    fog:              {enabled: true, p: 0.25, max_density: 0.7}
+    motion_blur:      {enabled: true, p: 0.25, max_kernel: 15}
+    water_reflection: {enabled: true, p: 0.25, strength: 0.5}
+    dust:             {enabled: true, p: 0.25, max_density: 0.5}
+
+model:
+  encoder: mobilenet_v3_large
+  pretrained: true                 # falls back to random init (with a warning) if download fails
+  decoder_channels: [128, 64, 40, 24]
+  gn_max_groups: 8
+  seg_classes: 2
+  terrain_classes: 4
+  terrain_hidden: 64
+  terrain_dropout: 0.2
+
+student:
+  encoder: mobilenet_v3_small
+  pretrained: true
+  decoder_channels: [64, 32, 24, 16]
+  gn_max_groups: 8
+  seg_classes: 2
+  terrain_classes: 4
+  terrain_hidden: 32
+  terrain_dropout: 0.2
+
+loss:
+  dice_weight: 1.0
+  boundary: {w0: 5.0, sigma: 5.0}
+  aux_weight: 0.4                  # < main (1.0)
+  evidential_kl_anneal_epochs: 10
+  evidence_clip: 1000.0
+  terrain_ignore_index: -1
+
+train:
+  epochs: 50
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 5.0
+  amp: true                        # only effective on CUDA
+  ece_bins: 15
+  log_every: 20
+
+distill:
+  epochs: 30
+  temperature: 2.0
+  lambda_distill: 1.0
+  w_seg: 1.0
+  w_conf: 1.0
+  w_terrain: 0.5
+  teacher_checkpoint: ./outputs/checkpoints/teacher_best.pt
+
+compression:
+  prune_amount: 0.3                # fraction of decoder-internal channels removed
+  prune_finetune_epochs: 0
+  ptq_calibration_batches: 4
+  fps_warmup: 3
+  fps_iters: 10
+  cpu_threads: 0                   # 0 = leave torch default
+
+classical:
+  seed_region: {top: 0.72, bottom: 0.98, half_width_top: 0.12, half_width_bottom: 0.30}
+  color_k: 2.5                     # Mahalanobis-like threshold multiplier
+  canny: [60, 160]
+  edge_dilate: 2
+  morph_kernel: 7
+  horizon_frac: 0.25               # ignore everything above this fraction of image height
+
+consistency:
+  geometric:
+    area_frac_range: [0.05, 0.85]
+    weights: {area: 0.2, solidity: 0.25, perspective: 0.25, connectivity: 0.2, bottom_touch: 0.1}
+  temporal:
+    expected_shift_per_mps: 0.02   # tolerated boundary shift (fraction of width) per m/s of speed
+    base_shift: 0.01               # tolerated shift when stationary (fraction of width)
+    tau: 0.05                      # decay constant of the score beyond tolerance
+    dt: 1.0                        # nominal inter-processed-frame interval scale
+
+fusion:
+  gain: 8.0
+  w_certainty: 0.5
+  w_geometric: 0.25
+  w_temporal: 0.25
+  bias: -0.5
+  terrain_penalty: [0.0, 0.1, 0.3, 0.5]   # per terrain class (paved..water_or_other)
+  hidden: 16
+  fallback_threshold: 0.5          # alpha below this -> "FALLBACK" is the active estimator
+  mask_threshold: 0.5
+  train_csv: ./outputs/fusion_training_data.csv   # PLACEHOLDER: does not exist yet
+
+inference:
+  checkpoint: ./outputs/checkpoints/student_best.pt   # or teacher_best.pt
+  frame_skip: 1                    # process every Nth frame (others reuse last result)
+  queue_size: 8
+  speed_mps_input: 1.0             # current vehicle speed fed to the temporal check
+  display: false
+  video_fourcc: mp4v
+  detector:
+    backend: yolov8n               # yolov8n | none
+    weights: yolov8n.pt
+    conf: 0.35
+    # COCO ids: person, bicycle, car, motorcycle, bus, truck
+    class_ids: [0, 1, 2, 3, 5, 7]
+    # CATTLE DETECTOR PLUG-IN POINT: add the custom class id(s) here and set
+    # `weights` to your fine-tuned model (see inference/detector.py).
+  decision:
+    max_steer_deg: 30.0
+    v_max: 1.5                     # m/s command ceiling
+    trust_min: 0.3
+    width_ref: 0.35                # drivable width (frac of image width) for full speed
+    lookahead_rows: [0.55, 0.9]    # row band (frac of H) for centroid / width
+    prox_slow: 0.55                # obstacle box-bottom (frac of H) where slowing starts
+    prox_stop: 0.85                # ... where speed -> 0
+    corridor_half_width: 0.2       # corridor around steering centre (frac of W)
+    terrain_speed_factor: [1.0, 0.7, 0.5, 0.3]
+    obstacle_dilate_px: 6
+
+evaluation:
+  low_miou_thr: 0.6            # frame mIoU below this -> "low_mIoU_frame"
+  good_iou_thr: 0.9            # frames above this are not considered wrong at all
+  boundary_band_px: 5          # width of the band around the GT boundary
+  boundary_frac_thr: 0.6       # share of errors inside the band -> "boundary_error"
+  missed_obstacle_frac_thr: 0.2  # share of GT-obstacle pixels predicted drivable -> "missed_obstacle"
+  min_obstacle_px: 30
+  max_saved_failures: 50
+
+smoke:
+  image_size: [96, 96]
+  num_train: 32
+  num_val: 8
+  batch_size: 8
+  epochs: 2
+  pretrained: false
+  video_frames: 12
+  video_size: [160, 120]           # (W, H)
