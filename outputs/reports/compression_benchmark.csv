@@ -1,0 +1,5 @@
+variant,method,params_M,size_MB,cpu_fps,miou,iou_drivable,pixel_acc,terrain_acc,ece
+original_teacher,fp32,4.587,18.428,12.01,0.9447,0.9188,0.9779,nan,0.0032
+distilled_student,fp32,1.394,5.646,23.47,0.9385,0.9097,0.9754,nan,0.0061
+int8_ptq,int8_static_ptq_fx[onednn],nan,5.199,9.03,0.9354,0.9055,0.974,nan,0.0075
+structured_pruned,decoder_L1_filter_prune_0.30,4.117,16.551,12.94,0.7414,0.6522,0.8714,nan,0.0843

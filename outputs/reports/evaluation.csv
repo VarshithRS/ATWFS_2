@@ -1,0 +1,6 @@
+metric,value
+miou_idd,0.9384851702538475
+iou_nondrivable,0.9672614298060612
+iou_drivable,0.9097089107016336
+terrain_acc,nan
+ece,0.006058830229649121
