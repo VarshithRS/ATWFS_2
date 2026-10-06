@@ -55,9 +55,9 @@ class FusionNet(nn.Module):
         b = g * (c["w_certainty"] + c["bias"])
         gen = torch.Generator().manual_seed(0)
         with torch.no_grad():
-            self.fc1.weight.copy_(torch.randn_like(self.fc1.weight, generator=gen) * 1e-3)
+            self.fc1.weight.copy_(torch.randn(self.fc1.weight.shape, generator=gen) * 1e-3)
             self.fc1.bias.zero_()
-            self.fc2.weight.copy_(torch.randn_like(self.fc2.weight, generator=gen) * 1e-3)
+            self.fc2.weight.copy_(torch.randn(self.fc2.weight.shape, generator=gen) * 1e-3)
             self.fc2.bias.zero_()
             self.fc1.weight[0], self.fc1.weight[1] = w, -w
             self.fc1.bias[0], self.fc1.bias[1] = b, -b
