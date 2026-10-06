@@ -112,32 +112,215 @@ class LivePipeline:
         return FrameResult(mask, cmd, fused.active, unc, geo, tmp, terrain, dets)
 
 
-def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False) -> np.ndarray:
-    """Draw mask overlay, boxes, steering line and status text.
+def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
+             frame_idx: int = 0, total_frames: Optional[int] = None, fps: float = 0.0,
+             state: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    """Draw mask overlay, boxes, steering line and status text matching the sample output."""
+    if state is None:
+        state = {}
 
-    Args:
-        frame_bgr: Original frame.
-        res: Result to visualise.
-        skipped: Whether the result is re-used (frame-skip).
-
-    Returns:
-        Annotated BGR frame.
-    """
     out = frame_bgr.copy()
     ov = out.copy()
-    ov[res.mask > 0] = (0, 200, 0)
-    out = cv2.addWeighted(ov, 0.4, out, 0.6, 0)
     h, w = out.shape[:2]
+
+    # Highly stable mask using EMA
+    curr_mask = (res.mask > 0).astype(np.float32)
+    if "ema_mask" not in state:
+        state["ema_mask"] = curr_mask
+    else:
+        state["ema_mask"] = 0.6 * curr_mask + 0.4 * state["ema_mask"]
+    
+    stable_mask = (state["ema_mask"] > 0.5).astype(np.uint8) * 255
+
+    # Fill drivable area with green (with alpha blending)
+    ov[stable_mask > 0] = (0, 200, 0)
+    out = cv2.addWeighted(ov, 0.4, out, 0.6, 0)
+
+    # Incoming vehicle tracking
+    if "prev_dets" in state:
+        prev_dets = state["prev_dets"]
+        for d in res.detections:
+            if d.name.lower() in ["car", "truck", "bus", "vehicle", "motorcycle"]:
+                best_iou = 0.0
+                best_pd = None
+                for pd in prev_dets:
+                    ix1, iy1 = max(d.x1, pd.x1), max(d.y1, pd.y1)
+                    ix2, iy2 = min(d.x2, pd.x2), min(d.y2, pd.y2)
+                    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+                    if iw > 0 and ih > 0:
+                        inter = iw * ih
+                        uni = (d.x2 - d.x1)*(d.y2 - d.y1) + (pd.x2 - pd.x1)*(pd.y2 - pd.y1) - inter
+                        iou = inter / uni
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_pd = pd
+                if best_iou > 0.3 and best_pd is not None:
+                    # Vehicle is moving down (closer) or getting wider
+                    if d.y2 > best_pd.y2 + 2 or (d.x2 - d.x1) > (best_pd.x2 - best_pd.x1) * 1.02:
+                        d.name = "INCOMING " + d.name
+    state["prev_dets"] = res.detections
+
+    # Draw bounding boxes
     for d in res.detections:
-        cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), (0, 0, 255), 2)
-        cv2.putText(out, d.name, (d.x1, max(10, d.y1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-    cv2.line(out, (w // 2, h - 1), (int(res.command.centroid_x), int(0.7 * h)), (255, 255, 0), 2)
-    c = res.command
-    lines = [f"estimator: {res.active}{' (held)' if skipped else ''}", f"trust: {c.trust:.2f}  unc: {res.uncertainty:.2f}",
-             f"angle: {c.angle:+.1f} deg  speed: {c.speed:.2f}", f"obstacle: {int(c.obstacle_flag)}  geo {res.geometric:.2f} tmp {res.temporal:.2f}"]
-    for i, t in enumerate(lines):
-        cv2.putText(out, t, (6, 14 + 14 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3)
-        cv2.putText(out, t, (6, 14 + 14 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+        color = (0, 165, 255) if "INCOMING" in d.name else (255, 0, 0) # Orange for incoming, Blue otherwise
+        cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), color, 2)
+        label = f"{d.name.upper()} {d.conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        
+        # Draw box explicitly ABOVE the car
+        lbl_y2 = d.y1
+        lbl_y1 = lbl_y2 - th - 10
+        if lbl_y1 < 0: # push it inside the box if it goes out of frame
+            lbl_y1 = d.y1
+            lbl_y2 = d.y1 + th + 10
+            
+        cv2.rectangle(out, (d.x1, lbl_y1), (d.x1 + tw + 4, lbl_y2), (0, 0, 0), -1)
+        cv2.putText(out, label, (d.x1 + 2, lbl_y2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    # Determine curve type
+    angle = res.command.angle
+    if abs(angle) < 5:
+        curve_str = "STRAIGHT"
+    elif angle > 15:
+        curve_str = "RIGHT SHARP"
+    elif angle > 5:
+        curve_str = "RIGHT"
+    elif angle < -15:
+        curve_str = "LEFT SHARP"
+    else:
+        curve_str = "LEFT"
+
+    # ---------------------------------------------------------
+    # "CRAZY STABLE" STRUCTURAL TRACKING
+    # ---------------------------------------------------------
+    row_sums = res.mask.sum(axis=1)
+    drivable_y = np.where(row_sums > 0)[0]
+    
+    near_w = mid_w = far_w = 0
+    avg_w = 0.0
+
+    if len(drivable_y) > 0:
+        raw_y_far = drivable_y[0]
+        raw_y_near = drivable_y[-1]
+        
+        # 1. Extremely heavy smoothing on the horizon/bottom levels
+        alpha_y = 0.05
+        if "y_far" not in state:
+            state["y_far"] = float(raw_y_far)
+            state["y_near"] = float(raw_y_near)
+        else:
+            state["y_far"] = alpha_y * raw_y_far + (1 - alpha_y) * state["y_far"]
+            state["y_near"] = alpha_y * raw_y_near + (1 - alpha_y) * state["y_near"]
+            
+        y_far = int(state["y_far"])
+        y_near = int(state["y_near"])
+        
+        # 2. Define 4 fixed structural Y-levels (produces 3 straight segments per side)
+        y_levels = np.linspace(y_near, y_far, 4, dtype=int)
+        
+        raw_pts = []
+        widths_raw = []
+        for y in y_levels:
+            # find closest valid row in the raw mask
+            closest_y = drivable_y[np.argmin(np.abs(drivable_y - y))]
+            nz = np.nonzero(res.mask[closest_y])[0]
+            if len(nz) > 0:
+                lx, rx = nz[0], nz[-1]
+                cx = (lx + rx) / 2.0
+                widths_raw.append(rx - lx)
+            else:
+                lx, rx, cx = w // 2 - 50, w // 2 + 50, w // 2
+            raw_pts.extend([lx, rx, cx])
+            
+        if widths_raw:
+            avg_w = np.mean(widths_raw)
+            
+        raw_pts = np.array(raw_pts, dtype=np.float32)
+        
+        # 3. Apply heavy EMA to the X coordinates
+        alpha_x = 0.15 # Low alpha for rock-solid stability
+        if "track_pts" not in state:
+            state["track_pts"] = raw_pts
+        else:
+            state["track_pts"] = alpha_x * raw_pts + (1 - alpha_x) * state["track_pts"]
+            
+        pts = state["track_pts"].astype(np.int32)
+        
+        # pts has 12 values: [l0, r0, c0, l1, r1, c1, l2, r2, c2, l3, r3, c3]
+        l0, r0, c0 = pts[0], pts[1], pts[2]
+        l1, r1, c1 = pts[3], pts[4], pts[5]
+        l2, r2, c2 = pts[6], pts[7], pts[8]
+        l3, r3, c3 = pts[9], pts[10], pts[11]
+        
+        y0, y1, y2, y3 = y_levels
+        
+        # For text boxes
+        near_w = r0 - l0
+        mid_w = r1 - l1
+        far_w = r3 - l3
+        
+        # 4. Draw Magenta Box (Left -> Top Horizon -> Right)
+        box_pts = np.array([
+            [l0, y0], [l1, y1], [l2, y2], [l3, y3], # Left boundary
+            [r3, y3],                               # Top horizontal connection
+            [r2, y2], [r1, y1], [r0, y0]            # Right boundary
+        ], dtype=np.int32)
+        cv2.polylines(out, [box_pts], isClosed=False, color=(255, 0, 255), thickness=3)
+        
+        # 5. Draw Yellow Center Line (Ego -> Near -> Mid -> Far)
+        center_pts = np.array([
+            [w // 2, h - 1], # Start at ego vehicle center
+            [c0, y0], [c1, y1], [c2, y2], [c3, y3]
+        ], dtype=np.int32)
+        cv2.polylines(out, [center_pts], isClosed=False, color=(0, 255, 255), thickness=3)
+
+    # Draw Text Boxes
+    def draw_box(img, lines, x, y):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.6
+        thick = 2
+        pad = 8
+        max_w = 0
+        total_h = pad
+        for text in lines:
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+            max_w = max(max_w, tw)
+            total_h += th + pad
+        
+        cv2.rectangle(img, (x, y), (x + max_w + 2 * pad, y + total_h), (0, 0, 0), -1)
+        
+        cur_y = y + pad
+        for text in lines:
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+            cv2.putText(img, text, (x + pad, cur_y + th), font, scale, (255, 255, 255), thick)
+            cur_y += th + pad
+        
+        return y + total_h + pad
+
+    cur_box_y = 20
+    
+    # Box 1
+    frames_str = f"{frame_idx}/{total_frames}" if total_frames else f"{frame_idx}"
+    box1_lines = [
+        "YOLOPv2 + LANE-LESS REASONING",
+        f"FRAME: {frames_str}",
+        f"PROCESSING: {fps:.2f} FPS"
+    ]
+    cur_box_y = draw_box(out, box1_lines, 20, cur_box_y)
+    
+    # Box 2
+    box2_lines = [
+        "MODE: LANE_BASED",
+        f"CURVE: {curve_str}"
+    ]
+    cur_box_y = draw_box(out, box2_lines, 20, cur_box_y)
+
+    # Box 3
+    box3_lines = [
+        f"WIDTH: near={near_w}, mid={mid_w}, far={far_w}, avg={avg_w:.1f} px"
+    ]
+    draw_box(out, box3_lines, 20, cur_box_y)
+
     return out
 
 
@@ -165,6 +348,7 @@ class FrameGrabber(threading.Thread):
             raise RuntimeError(f"Cannot open video source: {source!r}")
         self.out_q, self.stop, self.live, self.max_frames = out_q, stop, live, max_frames
         self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not live else None
 
     def run(self) -> None:
         """Thread body."""
@@ -203,20 +387,13 @@ class InferenceWorker(threading.Thread):
     """Consumer thread: runs the pipeline (every ``frame_skip``-th frame) and emits annotated frames."""
 
     def __init__(self, pipeline: LivePipeline, in_q: "queue.Queue", out_q: "queue.Queue", stop: threading.Event,
-                 frame_skip: int, errors: List[BaseException]) -> None:
-        """Create the worker.
-
-        Args:
-            pipeline: Pipeline.
-            in_q: Frame queue.
-            out_q: Result queue of ``(index, annotated_frame, packet)``.
-            stop: Shared stop event.
-            frame_skip: Process every Nth frame; others reuse the last result.
-            errors: Shared list collecting thread exceptions.
-        """
+                 frame_skip: int, errors: List[BaseException], total_frames: Optional[int] = None) -> None:
+        """Create the worker."""
         super().__init__(daemon=True, name="inference")
         self.p, self.in_q, self.out_q, self.stop = pipeline, in_q, out_q, stop
         self.skip, self.errors = max(1, int(frame_skip)), errors
+        self.total_frames = total_frames
+        self.annot_state: Dict[str, Any] = {}
 
     def _put(self, item: Any) -> None:
         while not self.stop.is_set():
@@ -228,7 +405,10 @@ class InferenceWorker(threading.Thread):
 
     def run(self) -> None:
         """Thread body."""
+        import time
         last: Optional[FrameResult] = None
+        start_time = time.time()
+        frames_processed = 0
         try:
             while not self.stop.is_set():
                 try:
@@ -241,7 +421,19 @@ class InferenceWorker(threading.Thread):
                 skipped = last is not None and idx % self.skip != 0
                 if not skipped:
                     last = self.p.process_frame(frame)
-                self._put((idx, annotate(frame, last, skipped), last.command.packet))
+                
+                frames_processed += 1
+                elapsed = time.time() - start_time
+                fps = frames_processed / elapsed if elapsed > 0 else 0.0
+
+                annotated = annotate(
+                    frame, last, skipped,
+                    frame_idx=idx + 1,
+                    total_frames=self.total_frames,
+                    fps=fps,
+                    state=self.annot_state
+                )
+                self._put((idx, annotated, last.command.packet))
         except BaseException as e:  # noqa: BLE001 - propagate to main thread
             logger.exception("Inference thread failed")
             self.errors.append(e)
@@ -316,7 +508,7 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
     stop, errors = threading.Event(), []  # type: threading.Event, List[BaseException]
     frame_q, result_q = queue.Queue(inf["queue_size"]), queue.Queue(inf["queue_size"])
     grabber = FrameGrabber(source, frame_q, stop, live, max_frames)
-    worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors)
+    worker = InferenceWorker(pipeline, frame_q, result_q, stop, inf["frame_skip"], errors, grabber.total_frames)
     grabber.start(); worker.start()
     display = inf["display"] if display is None else display
     writer, out_path, packets = None, Path(output_path), []

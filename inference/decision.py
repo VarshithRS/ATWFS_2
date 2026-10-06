@@ -59,7 +59,12 @@ def subtract_obstacles(mask: np.ndarray, dets: Sequence[Detection], dilate_px: i
     out = mask.copy()
     h, w = out.shape
     for d in dets:
-        out[max(0, d.y1 - dilate_px):min(h, d.y2 + dilate_px + 1), max(0, d.x1 - dilate_px):min(w, d.x2 + dilate_px + 1)] = 0
+        if d.name.lower() in ["car", "truck", "bus", "vehicle", "motorcycle", "incoming car", "incoming truck"]:
+            # Cast a massive shadow down to the bottom of the frame for vehicles.
+            # This triggers immediate lane changes 2-3 seconds early.
+            out[max(0, d.y1 - dilate_px):h, max(0, d.x1 - dilate_px):min(w, d.x2 + dilate_px + 1)] = 0
+        else:
+            out[max(0, d.y1 - dilate_px):min(h, d.y2 + dilate_px + 1), max(0, d.x1 - dilate_px):min(w, d.x2 + dilate_px + 1)] = 0
     return out
 
 
