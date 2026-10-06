@@ -1,9 +1,0 @@
-index,status,tags,iou_drivable,frame_miou,boundary_frac,obstacle_miss_frac,terrain_pred,terrain_gt
-0,wrong,terrain_misclassification|low_mIoU_frame,0.4002,0.5777,0.5518,0.1615,3,1
-1,wrong,terrain_misclassification|missed_obstacle|low_mIoU_frame,0.3208,0.5279,0.547,0.9833,3,1
-2,wrong,terrain_misclassification|low_mIoU_frame,0.0355,0.3156,0.4217,0.0,0,2
-3,wrong,terrain_misclassification|missed_obstacle|low_mIoU_frame|boundary_error,0.0885,0.3698,0.6199,0.2016,3,0
-4,wrong,terrain_misclassification,0.4619,0.632,0.517,0.1176,3,1
-5,wrong,terrain_misclassification|low_mIoU_frame,0.1552,0.4122,0.5546,0.0,3,2
-6,wrong,terrain_misclassification|low_mIoU_frame,0.0231,0.294,0.3728,0.0,0,2
-7,wrong,terrain_misclassification|low_mIoU_frame,0.0191,0.2902,0.3669,0.0,0,2
