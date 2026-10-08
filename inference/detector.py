@@ -95,12 +95,27 @@ class YoloV8nDetector(ObstacleDetector):
         Returns:
             Filtered detections.
         """
-        res = self.model.predict(bgr, conf=self.conf, classes=self.class_ids, verbose=False)[0]
+        # Use YOLO's built-in tracker to perfectly stabilize bounding boxes
+        res = self.model.track(bgr, conf=self.conf, classes=self.class_ids, persist=True, verbose=False, tracker="botsort.yaml")[0]
         out: List[Detection] = []
         if res.boxes is None or len(res.boxes) == 0:
             return out
-        for (x1, y1, x2, y2), c, p in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.cls.cpu().numpy(), res.boxes.conf.cpu().numpy()):
-            out.append(Detection(int(x1), int(y1), int(x2), int(y2), int(c), self.names.get(int(c), str(int(c))), float(p)))
+        for box in res.boxes:
+            c = int(box.cls.item())
+            p = float(box.conf.item())
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            
+            # 1. Ignore the ego-vehicle hood (usually at the very bottom center of the camera)
+            # If the bounding box touches the bottom and takes up significant width or is mostly in the lower half
+            if y2 >= bgr.shape[0] - 10 and y1 > bgr.shape[0] * 0.4:
+                continue
+            
+            # Use tracker ID if available
+            obj_id = f"#{int(box.id.item())}" if box.id is not None else ""
+            base_name = self.names.get(c, str(c))
+            name = f"{base_name} {obj_id}".strip()
+            
+            out.append(Detection(x1, y1, x2, y2, c, name, p))
         return out
 
 

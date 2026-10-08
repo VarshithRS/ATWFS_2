@@ -123,18 +123,7 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
     ov = out.copy()
     h, w = out.shape[:2]
 
-    # Highly stable mask using EMA
-    curr_mask = (res.mask > 0).astype(np.float32)
-    if "ema_mask" not in state:
-        state["ema_mask"] = curr_mask
-    else:
-        state["ema_mask"] = 0.6 * curr_mask + 0.4 * state["ema_mask"]
-    
-    stable_mask = (state["ema_mask"] > 0.5).astype(np.uint8) * 255
-
-    # Fill drivable area with green (with alpha blending)
-    ov[stable_mask > 0] = (0, 200, 0)
-    out = cv2.addWeighted(ov, 0.4, out, 0.6, 0)
+    # (Raw pixel mask drawing removed. We now use a clean, professional structural polygon below)
 
     # Incoming vehicle tracking
     if "prev_dets" in state:
@@ -201,7 +190,8 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
 
     if len(drivable_y) > 0:
         raw_y_far = drivable_y[0]
-        raw_y_near = drivable_y[-1]
+        # Force the lane detection to start strictly above the car body (bottom 25% cropped)
+        raw_y_near = min(drivable_y[-1], int(h * 0.75))
         
         # 1. Extremely heavy smoothing on the horizon/bottom levels
         alpha_y = 0.05
@@ -225,8 +215,35 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
             closest_y = drivable_y[np.argmin(np.abs(drivable_y - y))]
             nz = np.nonzero(res.mask[closest_y])[0]
             if len(nz) > 0:
-                lx, rx = nz[0], nz[-1]
-                cx = (lx + rx) / 2.0
+                # Group contiguous pixels into separate routes
+                routes = []
+                route_start = nz[0]
+                for i in range(1, len(nz)):
+                    if nz[i] - nz[i-1] > 5: # Gap larger than 5 pixels means a different route (e.g. obstacle in between)
+                        routes.append((route_start, nz[i-1]))
+                        route_start = nz[i]
+                routes.append((route_start, nz[-1]))
+                
+                # Predictive Route Selection Model
+                # Choose the best route based on a score: (width) - (distance from center line)
+                # To maintain continuity, we prefer routes that are closest to the car's center (w // 2)
+                target_cx = w // 2 if len(raw_pts) == 0 else raw_pts[-1] # Use previous row's center for smooth path planning
+                
+                best_route = None
+                best_score = -float('inf')
+                
+                for r_lx, r_rx in routes:
+                    r_w = r_rx - r_lx
+                    r_cx = (r_lx + r_rx) / 2.0
+                    
+                    # Heuristic: Wider is better, closer to the expected path (target_cx) is better
+                    score = r_w - 0.5 * abs(r_cx - target_cx)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_route = (r_lx, r_rx, r_cx)
+                
+                lx, rx, cx = best_route
                 widths_raw.append(rx - lx)
             else:
                 lx, rx, cx = w // 2 - 50, w // 2 + 50, w // 2
@@ -237,8 +254,8 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
             
         raw_pts = np.array(raw_pts, dtype=np.float32)
         
-        # 3. Apply heavy EMA to the X coordinates
-        alpha_x = 0.15 # Low alpha for rock-solid stability
+        # 3. Apply EMA to the X coordinates (Increased alpha for quicker allocation when obstacles leave)
+        alpha_x = 0.35
         if "track_pts" not in state:
             state["track_pts"] = raw_pts
         else:
@@ -259,17 +276,24 @@ def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
         mid_w = r1 - l1
         far_w = r3 - l3
         
-        # 4. Draw Magenta Box (Left -> Top Horizon -> Right)
-        box_pts = np.array([
-            [l0, y0], [l1, y1], [l2, y2], [l3, y3], # Left boundary
-            [r3, y3],                               # Top horizontal connection
-            [r2, y2], [r1, y1], [r0, y0]            # Right boundary
+        # 4. Draw Professional Filled Polygon for Drivable Path
+        # Left boundary going up, Right boundary coming down
+        poly_pts = np.array([
+            [l0, y0], [l1, y1], [l2, y2], [l3, y3],
+            [r3, y3], [r2, y2], [r1, y1], [r0, y0]
         ], dtype=np.int32)
-        cv2.polylines(out, [box_pts], isClosed=False, color=(255, 0, 255), thickness=3)
         
-        # 5. Draw Yellow Center Line (Ego -> Near -> Mid -> Far)
+        # Create a transparent green overlay
+        poly_ov = out.copy()
+        cv2.fillPoly(poly_ov, [poly_pts], color=(0, 200, 0))
+        # Draw bold boundary lines
+        cv2.polylines(poly_ov, [poly_pts], isClosed=True, color=(0, 255, 0), thickness=3)
+        
+        # Blend the polygon with 0.24 opacity
+        out = cv2.addWeighted(poly_ov, 0.24, out, 0.76, 0)
+        
+        # 5. Draw Yellow Center Line (starts at y0 instead of bottom of screen for cleaner look)
         center_pts = np.array([
-            [w // 2, h - 1], # Start at ego vehicle center
             [c0, y0], [c1, y1], [c2, y2], [c3, y3]
         ], dtype=np.int32)
         cv2.polylines(out, [center_pts], isClosed=False, color=(0, 255, 255), thickness=3)

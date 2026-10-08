@@ -4,14 +4,14 @@
 seed: 42
 
 paths:
-  data_root: "C:/data/idd_converted"
+  data_root: "D:/Projects/ESA 2/idd_converted"
   output_dir: ./outputs
   checkpoint_dir: ./outputs/checkpoints
   report_dir: ./outputs/reports
 
 data:
   image_size: [256, 256]
-  num_workers: 2
+  num_workers: 0
   image_suffix: _leftImg8bit.png
   mask_suffix: _gtFine_labellevel3Ids.png
   ignore_label: 255
@@ -83,7 +83,7 @@ loss:
 
 train:
   epochs: 50
-  batch_size: 8
+  batch_size: 2
   lr: 0.001
   weight_decay: 0.0001
   grad_clip: 5.0

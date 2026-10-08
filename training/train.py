@@ -85,9 +85,17 @@ def save_checkpoint(path: Path, model: nn.Module, criterion: nn.Module, optimize
         model_cfg: Model config section needed to rebuild the model.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
     torch.save({"model": model.state_dict(), "criterion": criterion.state_dict(),
                 "optimizer": optimizer.state_dict() if optimizer else None,
-                "epoch": epoch, "metrics": metrics, "model_cfg": model_cfg}, path)
+                "epoch": epoch, "metrics": metrics, "model_cfg": model_cfg}, tmp_path)
+    try:
+        import os
+        os.replace(tmp_path, path)
+    except OSError:
+        import time
+        time.sleep(1)
+        os.replace(tmp_path, path)
 
 
 def load_model_from_checkpoint(path: str, device: torch.device) -> Tuple[MultiTaskUNet, Dict[str, Any]]:
@@ -151,7 +159,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, criteri
 # ------------------------------------------------------------------ main loop
 def run_training(cfg: Dict[str, Any], model: nn.Module, criterion: MultiTaskLoss, train_loader: DataLoader,
                  val_loader: DataLoader, device: torch.device, tag: str, model_cfg: Dict[str, Any],
-                 epochs: Optional[int] = None, extra_loss_fn: Optional[ExtraLoss] = None) -> Dict[str, Any]:
+                 epochs: Optional[int] = None, extra_loss_fn: Optional[ExtraLoss] = None, resume_path: Optional[str] = None) -> Dict[str, Any]:
     """Generic train/val loop used by teacher training, distillation and prune fine-tuning.
 
     Args:
@@ -180,7 +188,18 @@ def run_training(cfg: Dict[str, Any], model: nn.Module, criterion: MultiTaskLoss
     ckpt_dir = resolve_path(cfg["paths"]["checkpoint_dir"]); report_dir = resolve_path(cfg["paths"]["report_dir"])
     report_dir.mkdir(parents=True, exist_ok=True)
     history, best, best_path, last_path = [], -math.inf, ckpt_dir / f"{tag}_best.pt", ckpt_dir / f"{tag}_last.pt"
-    for ep in range(epochs):
+    start_ep = 0
+    if resume_path:
+        logger.info("Resuming from %s", resume_path)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        criterion.load_state_dict(ckpt["criterion"])
+        if ckpt.get("optimizer"):
+            opt.load_state_dict(ckpt["optimizer"])
+        start_ep = ckpt.get("epoch", -1) + 1
+        for _ in range(start_ep):
+            sched.step()
+    for ep in range(start_ep, epochs):
         model.train(); criterion.set_epoch(ep)
         t0, run, n = time.time(), 0.0, 0
         for it, batch in enumerate(train_loader):
@@ -242,7 +261,7 @@ def _write_curves(history: list, report_dir: Path, tag: str) -> None:
         logger.info("matplotlib not available; CSV/JSON curves written only.")
 
 
-def train(cfg: Dict[str, Any], synthetic: bool = False, tag: str = "teacher", epochs: Optional[int] = None) -> Dict[str, Any]:
+def train(cfg: Dict[str, Any], synthetic: bool = False, tag: str = "teacher", epochs: Optional[int] = None, resume_path: Optional[str] = None) -> Dict[str, Any]:
     """Build everything from ``cfg`` and train the teacher model.
 
     Args:
@@ -261,7 +280,7 @@ def train(cfg: Dict[str, Any], synthetic: bool = False, tag: str = "teacher", ep
     va = build_dataloader(build_dataset(cfg, "val", synthetic), cfg, False)
     model = build_model(cfg["model"], cfg["loss"]["evidence_clip"])
     crit = MultiTaskLoss(cfg["loss"])
-    return run_training(cfg, model, crit, tr, va, device, tag, cfg["model"], epochs)
+    return run_training(cfg, model, crit, tr, va, device, tag, cfg["model"], epochs, None, resume_path)
 
 
 def main() -> None:
@@ -272,13 +291,14 @@ def main() -> None:
     ap.add_argument("--cpu-fallback", action="store_true", help="2-epoch synthetic sanity run (tiny sizes)")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--tag", default="teacher")
+    ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     a = ap.parse_args()
     setup_logging()
     if a.cpu_fallback:
         cfg = smoke_config(); a.synthetic = True; a.tag = "smoke"; a.epochs = cfg["smoke"]["epochs"]
     else:
         cfg = load_config(a.config)
-    res = train(cfg, a.synthetic, a.tag, a.epochs)
+    res = train(cfg, a.synthetic, a.tag, a.epochs, a.resume)
     logger.info("Done. Best checkpoint: %s", res["best_path"])
 
 
