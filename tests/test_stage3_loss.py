@@ -32,9 +32,18 @@ def test_all_terrain_labels_ignored_is_finite_and_has_grads() -> None:
     model, crit = build_model(cfg["model"]), MultiTaskLoss(cfg["loss"])
     batch = _batch(cfg)
     batch["terrain"] = torch.full_like(batch["terrain"], -1)
+    
+    # Try forcing log_vars to large negative values to check bounding
+    crit.log_vars.data.fill_(-10.0)
+    
     total, _ = crit(model(batch["image"]), batch)
     total.backward()
-    assert torch.isfinite(total) and all(p.grad is not None for p in model.parameters())
+    
+    assert torch.isfinite(total)
+    # The loss must be bounded below because log_vars are clamped to -4
+    # and terrain is skipped
+    assert total.item() >= -8.0  # -4 * 2 tasks
+    assert all(p.grad is not None for p in model.parameters())
 
 
 def test_components() -> None:

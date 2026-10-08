@@ -7,11 +7,10 @@ classical fallback + geometric/temporal checks + trust fusion; threaded live inf
 
 ## 1. First things to do
 1. `pip install -r requirements.txt`
-2. **Update `paths.data_root` in `config.yaml`** to your IDD Segmentation folder (default `./data/idd`, containing
-   `leftImg8bit/{train,val,test}/<drive>/*_leftImg8bit.png` and `gtFine/...`). No personal path is hardcoded anywhere.
-3. Create level-3 masks if you only have polygons (AutoNUE `preperation/createLabels.py --id-type level3Id`).
-4. One-time label check: `python -m data.labels --data-root <idd>` (see "IDD details" below).
-5. Verify the install: `python run_all_smoke_tests.py` (no data/GPU needed).
+2. If using the Kaggle "archive" set (`image_archive/` and `mask_archive/`), it must first be converted into the standard IDD format. Run:
+   `python convert_idd.py --images image_archive --masks mask_archive --out ./data/idd_converted`
+3. **Update `paths.data_root` in `config.yaml`** to your converted folder (default `./data/idd_converted`).
+4. Verify the install: `python run_all_smoke_tests.py` (no data/GPU needed).
 
 ## 2. Folder structure
 ```
@@ -47,8 +46,8 @@ Add `--synthetic` to train/distill/evaluate to use procedurally generated data. 
 (or `training.train.colab_setup()`); IDD needs registration so place it in Drive and set `IDD_DRIVE_PATH`.
 
 ## 4. IDD details (confirmed vs. to-verify)
-Confirmed from the official repo (`AutoNUE/public-code`, `helpers/anue_labels.py` + README), **not guessed**:
-* masks: `gtFine/{split}/{drive}/{id}_gtFine_labellevel3Ids.png`; images `leftImg8bit/{split}/{drive}/{id}_leftImg8bit.png`
+* **Dataset Note**: The reported mIoU in our results is on a custom `val` split of the Kaggle data, **not** the official IDD val split.
+* masks: `gtFine/{split}/{drive}/{id}_gtFine_labellevel3Ids.png`; images `leftImg8bit/{split}/{drive}/{id}_leftImg8bit.png`/{split}/{drive}/{id}_gtFine_labellevel3Ids.png`; images `leftImg8bit/{split}/{drive}/{id}_leftImg8bit.png`
 * level-3 ids: road = 0; parking **and** drivable fallback = 1 (both level1 "drivable"); sidewalk = 2;
   non-drivable fallback = 3; 255 = unlabeled. => drivable = `{0, 1}` (`data.drivable_level3_ids`). Unlabeled -> non-drivable.
 * mIoU: 27x27 confusion matrix with an ignore bucket, FP includes ignored-GT pixels (`evaluation/evaluate.py`).

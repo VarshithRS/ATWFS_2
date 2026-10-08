@@ -153,15 +153,6 @@ class MultiTaskLoss(nn.Module):
         self.epoch = epoch
 
     def forward(self, out: Dict[str, Any], batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute the total loss.
-
-        Args:
-            out: Model output dict.
-            batch: Batch with ``mask`` (B,H,W), ``terrain`` (B,), optional ``bweight`` (B,H,W).
-
-        Returns:
-            ``(total scalar, dict of detached component values)``.
-        """
         c = self.cfg
         y = batch["mask"]
         logits = out["seg_logits"]
@@ -179,9 +170,15 @@ class MultiTaskLoss(nn.Module):
         l_evid, l_fit = evidential_loss(out["alpha"], y, kl_coef)
         l_terr = terrain_ce(out["terrain_logits"], batch["terrain"], c["terrain_ignore_index"])
         losses = torch.stack([l_seg, l_evid, l_terr])
-        total = (torch.exp(-self.log_vars) * losses + self.log_vars).sum()
+        
+        clamped_log_vars = torch.clamp(self.log_vars, -4.0, 4.0)
+        valid_terrain = (batch["terrain"] != c["terrain_ignore_index"]).any()
+        valid_mask = torch.tensor([True, True, valid_terrain.item()], device=self.log_vars.device)
+        
+        total = (torch.exp(-clamped_log_vars[valid_mask]) * losses[valid_mask] + clamped_log_vars[valid_mask]).sum()
+        
         info = {"loss": float(total.detach()), "seg": float(l_seg.detach()), "ce": float(l_ce.detach()),
                 "dice": float(l_dice.detach()), "boundary": float(l_bnd.detach()), "aux": float(l_aux.detach()),
                 "evidence": float(l_evid.detach()), "terrain": float(l_terr.detach()),
-                **{f"w_{n}": float(torch.exp(-self.log_vars[i]).detach()) for i, n in enumerate(self.TASKS)}}
+                **{f"w_{n}": float(torch.exp(-clamped_log_vars[i]).detach()) for i, n in enumerate(self.TASKS)}}
         return total, info

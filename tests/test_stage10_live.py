@@ -75,3 +75,33 @@ def test_frame_skip_and_default_detector(capsys) -> None:
     assert res["frames"] == 7
     pk = res["packets"]
     assert pk[1] == pk[0] and pk[2] == pk[0], "skipped frames must hold the last packet"
+
+def test_annotate_rendering() -> None:
+    from inference.live import annotate, FrameResult
+    from inference.decision import Command
+    cfg = smoke_config()
+    
+    # Create synthetic frame and masks
+    h, w = 480, 640
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    # 1. Empty mask (no corridor)
+    mask_empty = np.zeros((h, w), dtype=np.uint8)
+    res_empty = FrameResult(mask_empty, Command(0, 0, 0, False, 0.0, 0.0, 0.0), "TEST", 0.0, 0.0, 0.0, 0, [])
+    ann1 = annotate(frame, res_empty, cfg=cfg)
+    assert ann1.shape == (h, w, 3)
+    
+    # 2. Trapezoid mask
+    mask_trap = np.zeros((h, w), dtype=np.uint8)
+    pts = np.array([[200, 479], [440, 479], [380, 240], [260, 240]], dtype=np.int32)
+    cv2.fillPoly(mask_trap, [pts], 1)
+    res_trap = FrameResult(mask_trap, Command(0, 1.0, 1.0, False, 0.0, 0.0, 0.0), "TEST", 0.0, 0.0, 0.0, 0, [])
+    ann2 = annotate(frame, res_trap, cfg=cfg)
+    assert ann2.shape == (h, w, 3)
+    
+    # 3. Mask with car-sized hole
+    mask_hole = mask_trap.copy()
+    mask_hole[350:400, 300:340] = 0
+    res_hole = FrameResult(mask_hole, Command(0, 1.0, 1.0, False, 0.0, 0.0, 0.0), "TEST", 0.0, 0.0, 0.0, 0, [])
+    ann3 = annotate(frame, res_hole, cfg=cfg)
+    assert ann3.shape == (h, w, 3)

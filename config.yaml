@@ -4,7 +4,7 @@
 seed: 42
 
 paths:
-  data_root: "D:/Projects/ESA 2/idd_converted"
+  data_root: "./data/idd_converted"
   output_dir: ./outputs
   checkpoint_dir: ./outputs/checkpoints
   report_dir: ./outputs/reports
@@ -102,7 +102,7 @@ distill:
 
 compression:
   prune_amount: 0.3
-  prune_finetune_epochs: 0
+  prune_finetune_epochs: 5
   ptq_calibration_batches: 4
   fps_warmup: 3
   fps_iters: 10
@@ -146,12 +146,23 @@ inference:
   speed_mps_input: 1.0
   display: false
   video_fourcc: mp4v
+  use_terrain: false
+  hood_frac: 0.18
+
+  overlay:
+    bottom_frac: 0.90
+    n_levels: 8
+    merge_gap_frac: 0.03
+    min_width_frac: 0.04
+    ema_x: 0.35
+    ema_y: 0.2
+    show_mask: false
 
   detector:
     backend: yolov8n
     weights: yolov8n.pt
-    conf: 0.35
-    class_ids: [0, 1, 2, 3, 5, 7]
+    conf: 0.30
+    class_ids: [0, 1, 2, 3, 5, 7, 16, 17, 18, 19]
 
   decision:
     max_steer_deg: 30.0

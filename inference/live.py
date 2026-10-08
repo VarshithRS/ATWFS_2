@@ -14,6 +14,9 @@ Usage:
     python -m inference.live --source 0                      # webcam (also rtsp:// or http:// IP-camera URLs)
 """
 from __future__ import annotations
+import os
+import shutil
+import subprocess
 
 import argparse
 import logging
@@ -98,13 +101,30 @@ class LivePipeline:
         out = self.model(torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(self.device))
         dl_mask = out["seg_logits"].argmax(1)[0].cpu().numpy().astype(np.uint8)
         unc = float(evidential_uncertainty(out["alpha"]).mean())
-        terrain = int(out["terrain_logits"].argmax(1)[0])
+        if cfg["inference"].get("use_terrain", False):
+            terrain = int(out["terrain_logits"].argmax(1)[0])
+        else:
+            terrain = 0
         fb_mask = self.classical.estimate(small)
         geo = geometric_score(dl_mask, cfg["consistency"]["geometric"])
         tmp = temporal_score(self.prev_dl_mask, dl_mask, speed, cfg["consistency"]["temporal"])
         self.prev_dl_mask = dl_mask
         fused = self.fusion.fuse(dl_mask, fb_mask, unc, geo, tmp, terrain)
         mask = cv2.resize(fused.mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
+        
+        hood_frac = cfg["inference"].get("hood_frac", 0.0)
+        if hood_frac > 0:
+            hood_h = int(fh * hood_frac)
+            mask[fh - hood_h:, :] = 0
+            
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num_labels > 1:
+            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            mask = (labels == largest_label).astype(np.uint8)
+
         # ---- obstacle subtraction (YOLOv8n; custom cattle detector plugs in via inference/detector.py) ----
         dets = self.detector.detect(frame_bgr)
         mask = subtract_obstacles(mask, dets, cfg["inference"]["decision"]["obstacle_dilate_px"])
@@ -114,236 +134,205 @@ class LivePipeline:
 
 def annotate(frame_bgr: np.ndarray, res: FrameResult, skipped: bool = False,
              frame_idx: int = 0, total_frames: Optional[int] = None, fps: float = 0.0,
-             state: Optional[Dict[str, Any]] = None) -> np.ndarray:
-    """Draw mask overlay, boxes, steering line and status text matching the sample output."""
-    if state is None:
-        state = {}
-
+             state: Optional[Dict[str, Any]] = None, cfg: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    if state is None: state = {}
+    if cfg is None: cfg = {}
     out = frame_bgr.copy()
-    ov = out.copy()
     h, w = out.shape[:2]
+    
+    # Scale based on frame width (base 1280)
+    s = max(w / 1280.0, 0.5)
+    thickness = max(1, int(round(2 * s)))
+    font_scale = 0.7 * s
 
-    # (Raw pixel mask drawing removed. We now use a clean, professional structural polygon below)
+    # Configs
+    overlay_cfg = cfg.get("inference", {}).get("overlay", {})
+    bottom_frac = overlay_cfg.get("bottom_frac", 0.90)
+    n_levels = overlay_cfg.get("n_levels", 8)
+    merge_gap_frac = overlay_cfg.get("merge_gap_frac", 0.03)
+    min_width_frac = overlay_cfg.get("min_width_frac", 0.04)
+    ema_x = overlay_cfg.get("ema_x", 0.35)
+    ema_y = overlay_cfg.get("ema_y", 0.20)
+    show_mask = overlay_cfg.get("show_mask", False)
 
-    # Incoming vehicle tracking
-    if "prev_dets" in state:
-        prev_dets = state["prev_dets"]
-        for d in res.detections:
-            if d.name.lower() in ["car", "truck", "bus", "vehicle", "motorcycle"]:
-                best_iou = 0.0
-                best_pd = None
-                for pd in prev_dets:
-                    ix1, iy1 = max(d.x1, pd.x1), max(d.y1, pd.y1)
-                    ix2, iy2 = min(d.x2, pd.x2), min(d.y2, pd.y2)
-                    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-                    if iw > 0 and ih > 0:
-                        inter = iw * ih
-                        uni = (d.x2 - d.x1)*(d.y2 - d.y1) + (pd.x2 - pd.x1)*(pd.y2 - pd.y1) - inter
-                        iou = inter / uni
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_pd = pd
-                if best_iou > 0.3 and best_pd is not None:
-                    # Vehicle is moving down (closer) or getting wider
-                    if d.y2 > best_pd.y2 + 2 or (d.x2 - d.x1) > (best_pd.x2 - best_pd.x1) * 1.02:
-                        d.name = "INCOMING " + d.name
-    state["prev_dets"] = res.detections
+    gap = int(merge_gap_frac * w)
+    min_width = int(min_width_frac * w)
 
-    # Draw bounding boxes
-    for d in res.detections:
-        color = (0, 165, 255) if "INCOMING" in d.name else (255, 0, 0) # Orange for incoming, Blue otherwise
-        cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), color, 2)
-        label = f"{d.name.upper()} {d.conf:.2f}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-        
-        # Draw box explicitly ABOVE the car
-        lbl_y2 = d.y1
-        lbl_y1 = lbl_y2 - th - 10
-        if lbl_y1 < 0: # push it inside the box if it goes out of frame
-            lbl_y1 = d.y1
-            lbl_y2 = d.y1 + th + 10
-            
-        cv2.rectangle(out, (d.x1, lbl_y1), (d.x1 + tw + 4, lbl_y2), (0, 0, 0), -1)
-        cv2.putText(out, label, (d.x1 + 2, lbl_y2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    if show_mask:
+        contours, _ = cv2.findContours(res.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, (255, 0, 255), max(1, int(s)))
 
-    # Determine curve type
-    angle = res.command.angle
-    if abs(angle) < 5:
-        curve_str = "STRAIGHT"
-    elif angle > 15:
-        curve_str = "RIGHT SHARP"
-    elif angle > 5:
-        curve_str = "RIGHT"
-    elif angle < -15:
-        curve_str = "LEFT SHARP"
-    else:
-        curve_str = "LEFT"
-
-    # ---------------------------------------------------------
-    # "CRAZY STABLE" STRUCTURAL TRACKING
-    # ---------------------------------------------------------
+    # Find drivable rows
     row_sums = res.mask.sum(axis=1)
     drivable_y = np.where(row_sums > 0)[0]
     
-    near_w = mid_w = far_w = 0
-    avg_w = 0.0
+    corridor_found = False
+    road_width_pct = 0.0
 
     if len(drivable_y) > 0:
         raw_y_far = drivable_y[0]
-        # Force the lane detection to start strictly above the car body (bottom 25% cropped)
-        raw_y_near = min(drivable_y[-1], int(h * 0.75))
+        raw_y_near = min(int(h * bottom_frac), drivable_y[-1])
         
-        # 1. Extremely heavy smoothing on the horizon/bottom levels
-        alpha_y = 0.05
         if "y_far" not in state:
             state["y_far"] = float(raw_y_far)
             state["y_near"] = float(raw_y_near)
+            state["left_ema"] = np.zeros(n_levels)
+            state["right_ema"] = np.zeros(n_levels)
+            state["active_k"] = 0
         else:
-            state["y_far"] = alpha_y * raw_y_far + (1 - alpha_y) * state["y_far"]
-            state["y_near"] = alpha_y * raw_y_near + (1 - alpha_y) * state["y_near"]
+            state["y_far"] = ema_y * raw_y_far + (1 - ema_y) * state["y_far"]
+            state["y_near"] = ema_y * raw_y_near + (1 - ema_y) * state["y_near"]
             
         y_far = int(state["y_far"])
         y_near = int(state["y_near"])
         
-        # 2. Define 4 fixed structural Y-levels (produces 3 straight segments per side)
-        y_levels = np.linspace(y_near, y_far, 4, dtype=int)
-        
-        raw_pts = []
-        widths_raw = []
-        for y in y_levels:
-            # find closest valid row in the raw mask
-            closest_y = drivable_y[np.argmin(np.abs(drivable_y - y))]
-            nz = np.nonzero(res.mask[closest_y])[0]
-            if len(nz) > 0:
-                # Group contiguous pixels into separate routes
-                routes = []
-                route_start = nz[0]
-                for i in range(1, len(nz)):
-                    if nz[i] - nz[i-1] > 5: # Gap larger than 5 pixels means a different route (e.g. obstacle in between)
-                        routes.append((route_start, nz[i-1]))
-                        route_start = nz[i]
-                routes.append((route_start, nz[-1]))
+        if y_near > y_far + 10:
+            y_levels = np.linspace(y_near, y_far, n_levels, dtype=int)
+            lefts = []
+            rights = []
+            prev_run = None
+            
+            for i, y in enumerate(y_levels):
+                y = np.clip(y, 0, h - 1)
+                row = res.mask[y]
+                nz = np.nonzero(row)[0]
+                runs = []
+                if len(nz) > 0:
+                    start = nz[0]
+                    for j in range(1, len(nz)):
+                        if nz[j] - nz[j-1] > gap:
+                            runs.append([start, nz[j-1]])
+                            start = nz[j]
+                    runs.append([start, nz[-1]])
                 
-                # Predictive Route Selection Model
-                # Choose the best route based on a score: (width) - (distance from center line)
-                # To maintain continuity, we prefer routes that are closest to the car's center (w // 2)
-                target_cx = w // 2 if len(raw_pts) == 0 else raw_pts[-1] # Use previous row's center for smooth path planning
+                runs = [r for r in runs if r[1] - r[0] >= min_width]
+                if not runs:
+                    break
                 
-                best_route = None
-                best_score = -float('inf')
-                
-                for r_lx, r_rx in routes:
-                    r_w = r_rx - r_lx
-                    r_cx = (r_lx + r_rx) / 2.0
+                if prev_run is None:
+                    # Bottom level: nearest to W/2
+                    best_run = None
+                    best_dist = float('inf')
+                    for r in runs:
+                        if r[0] <= w/2 <= r[1]:
+                            dist = 0
+                        else:
+                            dist = min(abs(r[0] - w/2), abs(r[1] - w/2))
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_run = r
+                    prev_run = best_run
+                else:
+                    # Higher levels: max overlap
+                    best_run = None
+                    best_overlap = 0
+                    for r in runs:
+                        overlap = max(0, min(r[1], prev_run[1]) - max(r[0], prev_run[0]))
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_run = r
+                    if best_overlap == 0:
+                        break # Stop tracing
+                    prev_run = best_run
                     
-                    # Heuristic: Wider is better, closer to the expected path (target_cx) is better
-                    score = r_w - 0.5 * abs(r_cx - target_cx)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_route = (r_lx, r_rx, r_cx)
+                lefts.append(prev_run[0])
+                rights.append(prev_run[1])
+
+            k = len(lefts)
+            if k >= 2:
+                corridor_found = True
+                for i in range(k):
+                    if i >= state["active_k"]:
+                        state["left_ema"][i] = lefts[i]
+                        state["right_ema"][i] = rights[i]
+                    else:
+                        state["left_ema"][i] = ema_x * lefts[i] + (1 - ema_x) * state["left_ema"][i]
+                        state["right_ema"][i] = ema_x * rights[i] + (1 - ema_x) * state["right_ema"][i]
+                state["active_k"] = k
                 
-                lx, rx, cx = best_route
-                widths_raw.append(rx - lx)
-            else:
-                lx, rx, cx = w // 2 - 50, w // 2 + 50, w // 2
-            raw_pts.extend([lx, rx, cx])
-            
-        if widths_raw:
-            avg_w = np.mean(widths_raw)
-            
-        raw_pts = np.array(raw_pts, dtype=np.float32)
-        
-        # 3. Apply EMA to the X coordinates (Increased alpha for quicker allocation when obstacles leave)
-        alpha_x = 0.35
-        if "track_pts" not in state:
-            state["track_pts"] = raw_pts
-        else:
-            state["track_pts"] = alpha_x * raw_pts + (1 - alpha_x) * state["track_pts"]
-            
-        pts = state["track_pts"].astype(np.int32)
-        
-        # pts has 12 values: [l0, r0, c0, l1, r1, c1, l2, r2, c2, l3, r3, c3]
-        l0, r0, c0 = pts[0], pts[1], pts[2]
-        l1, r1, c1 = pts[3], pts[4], pts[5]
-        l2, r2, c2 = pts[6], pts[7], pts[8]
-        l3, r3, c3 = pts[9], pts[10], pts[11]
-        
-        y0, y1, y2, y3 = y_levels
-        
-        # For text boxes
-        near_w = r0 - l0
-        mid_w = r1 - l1
-        far_w = r3 - l3
-        
-        # 4. Draw Professional Filled Polygon for Drivable Path
-        # Left boundary going up, Right boundary coming down
-        poly_pts = np.array([
-            [l0, y0], [l1, y1], [l2, y2], [l3, y3],
-            [r3, y3], [r2, y2], [r1, y1], [r0, y0]
-        ], dtype=np.int32)
-        
-        # Create a transparent green overlay
-        poly_ov = out.copy()
-        cv2.fillPoly(poly_ov, [poly_pts], color=(0, 200, 0))
-        # Draw bold boundary lines
-        cv2.polylines(poly_ov, [poly_pts], isClosed=True, color=(0, 255, 0), thickness=3)
-        
-        # Blend the polygon with 0.24 opacity
-        out = cv2.addWeighted(poly_ov, 0.24, out, 0.76, 0)
-        
-        # 5. Draw Yellow Center Line (starts at y0 instead of bottom of screen for cleaner look)
-        center_pts = np.array([
-            [c0, y0], [c1, y1], [c2, y2], [c3, y3]
-        ], dtype=np.int32)
-        cv2.polylines(out, [center_pts], isClosed=False, color=(0, 255, 255), thickness=3)
-
-    # Draw Text Boxes
-    def draw_box(img, lines, x, y):
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.6
-        thick = 2
-        pad = 8
-        max_w = 0
-        total_h = pad
-        for text in lines:
-            (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
-            max_w = max(max_w, tw)
-            total_h += th + pad
-        
-        cv2.rectangle(img, (x, y), (x + max_w + 2 * pad, y + total_h), (0, 0, 0), -1)
-        
-        cur_y = y + pad
-        for text in lines:
-            (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
-            cv2.putText(img, text, (x + pad, cur_y + th), font, scale, (255, 255, 255), thick)
-            cur_y += th + pad
-        
-        return y + total_h + pad
-
-    cur_box_y = 20
+                y_active = y_levels[:k]
+                l_active = state["left_ema"][:k]
+                r_active = state["right_ema"][:k]
+                
+                deg = 2 if k >= 4 else 1
+                p_l = np.polyfit(y_active, l_active, deg)
+                p_r = np.polyfit(y_active, r_active, deg)
+                
+                y_samples = np.linspace(y_active[0], y_active[-1], 24)
+                l_fit = np.polyval(p_l, y_samples)
+                r_fit = np.polyval(p_r, y_samples)
+                
+                l_fit = np.clip(l_fit, 0, w - 1)
+                r_fit = np.clip(r_fit, 0, w - 1)
+                r_fit = np.maximum(r_fit, l_fit + 2)
+                
+                road_width_pct = (r_fit[0] - l_fit[0]) / w * 100.0
+                
+                c_fit = (l_fit + r_fit) / 2.0
+                
+                poly_pts = np.concatenate([
+                    np.column_stack([l_fit, y_samples]),
+                    np.column_stack([r_fit, y_samples])[::-1]
+                ]).astype(np.int32)
+                
+                overlay = out.copy()
+                cv2.fillPoly(overlay, [poly_pts], (0, 200, 0), lineType=cv2.LINE_AA)
+                cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+                
+                l_pts = np.column_stack([l_fit, y_samples]).astype(np.int32)
+                r_pts = np.column_stack([r_fit, y_samples]).astype(np.int32)
+                cv2.polylines(out, [l_pts], False, (0, 255, 0), thickness, cv2.LINE_AA)
+                cv2.polylines(out, [r_pts], False, (0, 255, 0), thickness, cv2.LINE_AA)
+                
+                c_pts = np.column_stack([c_fit, y_samples]).astype(np.int32)
+                cv2.polylines(out, [c_pts], False, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+                cv2.polylines(out, [c_pts], False, (0, 255, 255), thickness, cv2.LINE_AA)
+                
+                pt1 = tuple(c_pts[-2])
+                pt2 = tuple(c_pts[-1])
+                cv2.arrowedLine(out, pt1, pt2, (0, 0, 0), thickness + 2, cv2.LINE_AA, tipLength=0.2)
+                cv2.arrowedLine(out, pt1, pt2, (0, 255, 255), thickness, cv2.LINE_AA, tipLength=0.2)
     
-    # Box 1
+    if not corridor_found:
+        state.clear()
+        
+    for d in res.detections:
+        if d.name.lower() in ["car", "truck", "bus", "vehicle", "motorcycle"]:
+            # Basic tracking to see if it's growing/approaching
+            if "prev_dets" in state:
+                for pd in state["prev_dets"]:
+                    iou = max(0, min(d.x2, pd.x2) - max(d.x1, pd.x1)) * max(0, min(d.y2, pd.y2) - max(d.y1, pd.y1)) / ((d.x2 - d.x1)*(d.y2 - d.y1) + (pd.x2 - pd.x1)*(pd.y2 - pd.y1) + 1e-6)
+                    if iou > 0.3 and (d.y2 > pd.y2 + 2 or (d.x2 - d.x1) > (pd.x2 - pd.x1) * 1.02):
+                        d.name = "APPROACHING " + d.name
+                        break
+        state["prev_dets"] = res.detections
+        
+        color = (0, 165, 255) if "APPROACHING" in d.name else (0, 0, 255)
+        cv2.rectangle(out, (d.x1, d.y1), (d.x2, d.y2), color, thickness)
+        label = f"{d.name} {d.conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        lbl_y = max(th + 5, d.y1 - 5)
+        cv2.putText(out, label, (d.x1, lbl_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+        cv2.putText(out, label, (d.x1, lbl_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
+
     frames_str = f"{frame_idx}/{total_frames}" if total_frames else f"{frame_idx}"
-    box1_lines = [
-        "YOLOPv2 + LANE-LESS REASONING",
-        f"FRAME: {frames_str}",
-        f"PROCESSING: {fps:.2f} FPS"
-    ]
-    cur_box_y = draw_box(out, box1_lines, 20, cur_box_y)
+    ang = res.command.angle
+    curve = "STRAIGHT" if abs(ang) < 5 else ("RIGHT SHARP" if ang > 15 else ("RIGHT" if ang > 5 else ("LEFT SHARP" if ang < -15 else "LEFT")))
     
-    # Box 2
-    box2_lines = [
-        "MODE: LANE_BASED",
-        f"CURVE: {curve_str}"
+    lines = [
+        f"ATWFS DRIVABLE REGION | FRAME: {frames_str} | {fps:.1f} FPS",
+        f"ESTIMATOR: {res.active}   TRUST: {res.command.trust:.2f}",
+        f"STEER: {ang:+.1f} deg {curve}   SPEED: {res.command.speed:.2f} m/s",
+        f"OBSTACLE: {'YES' if res.command.obstacle_flag else 'NO'}",
+        f"ROAD WIDTH: {road_width_pct:.1f}%",
+        "LEGEND: Green=Corridor, Yellow=Path"
     ]
-    cur_box_y = draw_box(out, box2_lines, 20, cur_box_y)
-
-    # Box 3
-    box3_lines = [
-        f"WIDTH: near={near_w}, mid={mid_w}, far={far_w}, avg={avg_w:.1f} px"
-    ]
-    draw_box(out, box3_lines, 20, cur_box_y)
+    
+    y = int(25 * s)
+    for line in lines:
+        cv2.putText(out, line, (int(15*s), y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(out, line, (int(15*s), y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        y += int(30 * s)
 
     return out
 
@@ -455,7 +444,8 @@ class InferenceWorker(threading.Thread):
                     frame_idx=idx + 1,
                     total_frames=self.total_frames,
                     fps=fps,
-                    state=self.annot_state
+                    state=self.annot_state,
+                    cfg=self.p.cfg
                 )
                 self._put((idx, annotated, last.command.packet))
         except BaseException as e:  # noqa: BLE001 - propagate to main thread
@@ -554,9 +544,13 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
             # STUB for a future Arduino serial link: just a clean console line, no hardware code.
             print(f"[{pkt[0]:.2f}, {pkt[1]:.3f}, {pkt[2]:.3f}, {pkt[3]}]", flush=True)
             if display:  # pragma: no cover - needs a GUI
-                cv2.imshow("drivable region", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    stop.set()
+                try:
+                    cv2.imshow("drivable region", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        stop.set()
+                except Exception:
+                    logger.warning("cv2.imshow failed. install opencv-python for --display")
+                    display = False
     except KeyboardInterrupt:  # pragma: no cover
         logger.info("Interrupted by user")
         stop.set()
@@ -566,9 +560,45 @@ def run_video(cfg: Dict[str, Any], source: Union[int, str], output_path: str, mo
         if writer is not None:
             writer.release()
         if display:  # pragma: no cover
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
     if errors:
         raise RuntimeError(f"Inference thread crashed: {errors[0]!r}") from errors[0]
+        
+    # FFmpeg re-encoding
+    if out_path.exists() and writer is not None:
+        import shutil
+        import subprocess
+        import os
+        ffmpeg_exe = shutil.which("ffmpeg")
+        if not ffmpeg_exe:
+            try:
+                import imageio_ffmpeg
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            except ImportError:
+                ffmpeg_exe = None
+                
+        if ffmpeg_exe:
+            temp_out = out_path.with_suffix(".tmp.mp4")
+            cmd = [
+                ffmpeg_exe, "-y", "-i", str(out_path),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-crf", "20", "-preset", "veryfast",
+                "-movflags", "+faststart", str(temp_out)
+            ]
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                os.replace(str(temp_out), str(out_path))
+                logger.info("Successfully re-encoded to H.264")
+            except Exception as e:
+                logger.warning(f"FFmpeg re-encoding failed: {e}. Kept original file.")
+                if temp_out.exists():
+                    temp_out.unlink()
+        else:
+            logger.warning("FFmpeg not found. Kept original file. Install ffmpeg or imageio-ffmpeg for H.264 encoding.")
+
     logger.info("Processed %d frames -> %s", len(packets), out_path)
     return {"output_path": str(out_path), "frames": len(packets), "packets": packets}
 

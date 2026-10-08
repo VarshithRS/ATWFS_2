@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+outputs/smoke/
+outputs/checkpoints/*_last.pt
+check_*.png
+outputs/checkpoints/
+outputs/weights/
+*.pt
+*.mp4
+__pycache__/

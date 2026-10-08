@@ -17,3 +17,4 @@ matplotlib==3.10.8
 pytest==9.1.1
 # YOLOv8n obstacle detector (optional: pipeline degrades gracefully to "no detector" without it)
 ultralytics==8.4.173
+imageio-ffmpeg

@@ -21,7 +21,7 @@ import torch
 from data.dataset import build_dataloader, build_dataset
 from models.compression import cpu_fps, model_size_mb, prune_decoder_structured, quantize_int8_ptq
 from models.unet_mobilenet import build_model, count_params
-from training.distill import load_teacher
+from training.distill import load_teacher, make_distill_loss
 from training.losses import MultiTaskLoss
 from training.train import evaluate, load_model_from_checkpoint, run_training
 from utils.config import load_config, resolve_path, smoke_config
@@ -78,11 +78,14 @@ def run_benchmark(cfg: Dict[str, Any], synthetic: bool = False, teacher_ckpt: Op
     h, w = cfg["data"]["image_size"]
     calib = [b["image"] for b in itertools.islice(val_loader, c["ptq_calibration_batches"])]
     q_model, q_desc = quantize_int8_ptq(src, calib, calib[0][:1])
-    pruned = prune_decoder_structured(src, c["prune_amount"])
+    pruned = prune_decoder_structured(student, c["prune_amount"])
     if c["prune_finetune_epochs"] > 0:
         tr = build_dataloader(build_dataset(cfg, "train", synthetic), cfg, True)
-        mcfg = cfg["model"] if base == "teacher" else cfg["student"]
-        run_training(cfg, pruned, MultiTaskLoss(cfg["loss"]), tr, val_loader, device, "pruned", mcfg, c["prune_finetune_epochs"])
+        old_lr = cfg["train"]["lr"]
+        cfg["train"]["lr"] = old_lr / 10.0
+        distill_loss = make_distill_loss(teacher.to(device), cfg["distill"])
+        run_training(cfg, pruned, MultiTaskLoss(cfg["loss"]), tr, val_loader, device, "pruned", cfg["student"], c["prune_finetune_epochs"], distill_loss)
+        cfg["train"]["lr"] = old_lr
         pruned = pruned.cpu().eval()
     variants = [("original_teacher", "fp32", teacher, device), ("distilled_student", "fp32", student, device),
                 ("int8_ptq", q_desc, q_model, torch.device("cpu")),
